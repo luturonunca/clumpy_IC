@@ -5,6 +5,7 @@
 ###########################################################################################
 
 from __future__ import print_function
+import os
 import numpy as np
 import h5py
 
@@ -85,6 +86,23 @@ f[u'PartType1'][ u'Velocities'][...]  = np.column_stack((vx,vy,vz))
 
 f[u'PartType1'][ u'ParticleIDs'][...] = np.arange(N)
 
-print ("  (*) all done :o)" )
-
 f.close()
+
+### Optional RAMSES ascii output: <modelname>_ramses/ic_part with columns x y z vx vy vz m,
+### in RAMSES code units (G=1). RAMSES adds boxlen/2 to the positions when reading.
+write_ramses_ascii = True
+ramses_mU = 1.0e9   # Msol - RAMSES mass unit   (units_density*units_length**3)
+ramses_rU = 1.0     # kpc  - RAMSES length unit (units_length)
+ramses_vU = vU * np.sqrt( (ramses_mU/mU) / (ramses_rU/rU) )   # km/s, G=1 in both unit systems
+
+if write_ramses_ascii:
+  dirname = modelname[:-4] + "_ramses"
+  os.makedirs(dirname, exist_ok=True)
+  print ("  (*) Writing RAMSES ascii to \'%s/ic_part\' (mU=%.2e Msol, rU=%.2f kpc, vU=%.2f km/s)"%(dirname, ramses_mU, ramses_rU, ramses_vU) )
+  np.savetxt(os.path.join(dirname, "ic_part"),
+             np.column_stack(( np.column_stack((x,y,z)) * rU/ramses_rU,
+                               np.column_stack((vx,vy,vz)) * vU/ramses_vU,
+                               np.full(N, partmass * mU/ramses_mU) )),
+             fmt="%.8e")
+
+print ("  (*) all done :o)" )
