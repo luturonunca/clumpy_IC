@@ -48,6 +48,13 @@ physical scaling (`[scaling]`), extra point particles (`[particles]`) and RAMSES
 outputs (`[output]`: dimensionless `.npy`, Gadget2 HDF5, RAMSES ascii `ic_part`/`ic_sink` in the
 code units given by `units_length`, `units_density`, `units_time` from the RAMSES namelist).
 
+An optional `[gas]` section adds isothermal gas in hydrostatic balance with the potential of the
+sampled halo (gas self-gravity not included), written as RAMSES grafic files `ic_d`, `ic_p` on the
+`levelmin` grid next to `ic_part`. In the RAMSES namelist set `filetype='grafic'`: in a
+non-cosmological run the gas is then read from these files while the particles are still read from
+the ascii `ic_part`. RAMSES does not refine at t=0 in this mode; finer levels are interpolated from
+`levelmin` during the first steps.
+
 `mass` is the mass of the untruncated profile; particles only carry the part between `rmin` and
 `rmax`. A small `rmax` cuts through bound orbits and the outer halo expands: the printed
 virial ratio `2K / sum(m r.dPhi/dr)` is ~1 only when little mass lies beyond `rmax`.

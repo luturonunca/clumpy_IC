@@ -43,6 +43,24 @@ def write_hdf5(filename, pos, vel, partmass):
   f.close()
 
 
+def write_grafic(dirname, fields, dx):
+  """RAMSES grafic gas files for a non-cosmological run (filetype='grafic'): one
+  unformatted file per primitive variable (ic_d, ic_u, ic_v, ic_w, ic_p) in code units,
+  read by init_flow_fine at levelmin. Header n1,n2,n3,dx,xoff1-3,astart,omega_m,omega_l,h0,
+  then one record per z plane with x running fastest; arrays are indexed [ix,iy,iz]."""
+  from scipy.io import FortranFile
+  os.makedirs(dirname, exist_ok=True)
+  for name, arr in fields.items():
+    n1, n2, n3 = arr.shape
+    f = FortranFile(os.path.join(dirname, name), 'w')
+    f.write_record(np.array([n1, n2, n3], dtype=np.int32),
+                   np.array([dx, 0., 0., 0., 1., 0., 0., 0.], dtype=np.float32))
+    for i3 in range(n3):
+      f.write_record(np.array(arr[:,:,i3].T, dtype=np.float32))
+    f.close()
+  print ("  (*) Writing RAMSES grafic gas %s to \'%s\' (%i^3)"%(",".join(fields), dirname, n1) )
+
+
 def write_ramses(dirname, pos, vel, mass, sinks, units_length, units_density, units_time):
   """RAMSES ascii ICs: <dirname>/ic_part (x y z vx vy vz m) and, if any sinks,
   <dirname>/ic_sink (m x y z vx vy vz lx ly lz m_smbh). Code units follow RAMSES:

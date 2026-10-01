@@ -10,7 +10,7 @@ import numpy as np
 
 from clumpIC.eddington import build_df
 from clumpIC.sample import draw
-from clumpIC.writers import write_hdf5, write_ramses
+from clumpIC.writers import write_hdf5, write_ramses, write_grafic, MSOL, KPC
 
 G = 4.30091e-6   # kpc (km/s)^2 / Msol
 
@@ -38,6 +38,41 @@ def read_objects(config, section, pos, partmass, centre, extra_cols):
     print("  (*) %s %s: r=%.3f kpc, v_c=%.3f km/s"%(section[:-1], name, r, vc))
     objs.append(list(xyz) + vel + rest)
   return np.array(objs)
+
+
+def write_gas(g, df, M, rscale, centre_kpc, o):
+  """Isothermal gas in hydrostatic balance with the sampled (truncated) halo, on the RAMSES
+  levelmin grid: rho = rho_ref exp(-(Phi(r)-Phi(r_ref))/cs^2), P = rho cs^2, v = 0.
+  Phi is the model potential, shifted inside rmax and Keplerian outside it, so that it is
+  the potential of the particles actually sampled. Gas self-gravity is not included."""
+  units_length, units_density, units_time = [to_float(o[k]) for k in
+                                             ("units_length", "units_density", "units_time")]
+  lU = KPC / units_length
+  mU = MSOL / (units_density*units_length**3)
+  vU = 1e5 * units_time / units_length
+  R, psi, Mcum = df["R"], df["psi"], df["Mcum"]
+  def psi_t(x):   # dimensionless (M=1, rscale=1) potential of the halo truncated at R[-1]
+    return np.where(x < R[-1], np.interp(x, R, psi) - psi[-1] + Mcum[-1]/R[-1], Mcum[-1]/np.maximum(x, R[-1]))
+
+  cs      = to_float(g["cs"])          # km/s
+  rho_ref = to_float(g["rho_ref"])     # Msol/kpc^3 at r_ref
+  r_ref   = to_float(g["r_ref"])       # kpc
+  n       = 2**int(to_float(g["levelmin"]))
+  boxlen  = to_float(g["boxlen"])      # code units, as in &AMR_PARAMS
+  centre  = boxlen/2. + centre_kpc*lU     # halo centre ([scaling] centre) in code units
+
+  dx = boxlen/n
+  x = (np.arange(n)+0.5)*dx
+  X, Y, Z = np.meshgrid(x, x, x, indexing="ij")
+  r = np.sqrt((X-centre[0])**2 + (Y-centre[1])**2 + (Z-centre[2])**2) / lU   # kpc
+  phi = -G*M/rscale * psi_t(r/rscale)                                          # (km/s)^2
+  phi_ref = -G*M/rscale * psi_t(r_ref/rscale)
+  rho = rho_ref * np.exp(-(phi-phi_ref)/cs**2)                                 # Msol/kpc^3
+  print ("  (*) gas: cs=%.2f km/s, rho(%.2f kpc)=%.3e Msol/kpc^3, rho_max=%.3e, M_box=%.4e Msol"%(
+         cs, r_ref, rho_ref, rho.max(), rho.sum()*(dx/lU)**3) )
+  rho_code = rho * mU/lU**3
+  write_grafic(o.get("name", "model") + "_ramses",
+               {"ic_d": rho_code, "ic_p": rho_code*(cs*vU)**2}, dx)
 
 
 def main():
@@ -92,6 +127,9 @@ def main():
 
   particles = read_objects(config, "particles", pos, partmass, centre, 0)
   sinks     = read_objects(config, "sinks",     pos, partmass, centre, 1)
+
+  if config.has_section("gas") and o.getboolean("ramses_ascii", False):
+    write_gas(config["gas"], df, M, rscale, centre, o)
 
   if o.getboolean("hdf5", False):
     write_hdf5(name + ".hdf5", pos, vel, partmass)
