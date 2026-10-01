@@ -10,3 +10,21 @@ Generates N-body models through Eddington inversion, and paints stellar probabil
 To run on python2, add `from __future__ import print_function` .
 
 
+
+## clumpIC
+
+`clumpIC` wraps `nbody.py` and `nbody2hdf5.py` into one command driven by a config file
+(same Eddington inversion and sampling, in float64):
+
+    pip install -e .            # once, from this directory
+    clumpIC -c my_halo.ini      # run from the directory where the ICs should go
+
+See `examples/hernquist_sink_orbit.ini` for all options: profile and sampling (`[model]`),
+physical scaling (`[scaling]`), extra point particles (`[particles]`) and RAMSES sinks
+(`[sinks]`), where a velocity entry `vc`/`-vc` is the circular speed of the sampled halo, and
+outputs (`[output]`: dimensionless `.npy`, Gadget2 HDF5, RAMSES ascii `ic_part`/`ic_sink` in the
+code units given by `units_length`, `units_density`, `units_time` from the RAMSES namelist).
+
+`mass` is the mass of the untruncated profile; particles only carry the part between `rmin` and
+`rmax`. A small `rmax` cuts through bound orbits and the outer halo expands: the printed
+virial ratio `2K / sum(m r.dPhi/dr)` is ~1 only when little mass lies beyond `rmax`.
