@@ -8,8 +8,18 @@ import numpy as np
 from scipy.integrate import quad
 
 
-def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL):
-  def rho(r) :   return r**(-g) * (1. + r**a )**((g-b)/a)
+def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL, rt=None, rd=None):
+  def rho_abg(r) :   return r**(-g) * (1. + r**a )**((g-b)/a)
+  if rt is None:
+    rho = rho_abg
+  else:
+    # Kazantzidis, Magorrian & Moore (2004) cut-off beyond rt: rho(rt) (r/rt)^eps exp(-(r-rt)/rd),
+    # eps chosen so that density and logarithmic slope are continuous at rt (finite total mass)
+    eps = -g - (b-g) * rt**a/(1.+rt**a) + rt/rd
+    def rho(r) :
+      return rho_abg(r) if r <= rt else rho_abg(rt) * (r/rt)**eps * np.exp(-(r-rt)/rd)
+    rho = np.vectorize(rho, otypes=[float])
+    print("     (!) Kazantzidis cut-off at r_trunc=%g, r_decay=%g (units of rscale), eps=%.4f"%(rt, rd, eps))
   M =  4 * pi * quad( lambda r: r*r * rho(r) , 0., np.inf)[0] # non-normalized total mass
 
   R = np.logspace(np.log10(Rmin),np.log10(Rmax),num=int(NR))
@@ -58,4 +68,5 @@ def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL):
   maxPLikelihood = np.array(maxPLikelihood)
 
   return {"R": R, "psi": psi, "Mcum": Mcum, "E": E, "DF": DF,
-          "maxPLikelihood": maxPLikelihood, "fin": fin, "fout": fout}
+          "maxPLikelihood": maxPLikelihood, "fin": fin, "fout": fout,
+          "Mtot": M}   # total mass of the profile with rho_0 = 1, rscale = 1

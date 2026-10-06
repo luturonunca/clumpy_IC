@@ -43,6 +43,40 @@ def write_hdf5(filename, pos, vel, partmass):
   f.close()
 
 
+def write_g2(filename, pos, vel, mass, ptype):
+  """Gadget-2 binary, SnapFormat 2 (labelled blocks HEAD, POS, VEL, ID, MASS), as read by the
+  RAMSES DICE patch (ic_format='Gadget2') with its default gadget_scale_l/v/m: kpc, km/s,
+  1e10 Msol. Ported from write_gadget2 in halo&Clumps.ipynb. ptype 0..5 (1 = halo -> FAM_DM,
+  2..5 -> FAM_STAR); particles are written grouped by type, ids 1..N in that order."""
+  import struct
+  def outer_block(fh, tag4, payload):
+    # format 2: record with the 4-char label and the size of the next record, then the data record
+    fh.write(struct.pack('<i', 8)); fh.write(tag4)
+    fh.write(struct.pack('<i', len(payload)+8)); fh.write(struct.pack('<i', 8))
+    fh.write(struct.pack('<i', len(payload))); fh.write(payload); fh.write(struct.pack('<i', len(payload)))
+  order = np.argsort(ptype, kind='stable')
+  npart = np.bincount(np.asarray(ptype, dtype=int), minlength=6)[:6]
+  head = b''.join([np.asarray(npart, dtype='<i4').tobytes(),     # npart[6]
+                   np.zeros(6, dtype='<f8').tobytes(),            # mass[6]: 0 -> MASS block
+                   struct.pack('<d', 0.), struct.pack('<d', 0.),  # time, redshift
+                   struct.pack('<i', 0), struct.pack('<i', 0),    # flag_sfr, flag_feedback
+                   np.asarray(npart, dtype='<u4').tobytes(),     # npartTotal[6]
+                   struct.pack('<i', 0), struct.pack('<i', 1),    # flag_cooling, num_files
+                   struct.pack('<d', 0.), struct.pack('<d', 0.),  # BoxSize, Omega0
+                   struct.pack('<d', 0.), struct.pack('<d', 0.),  # OmegaLambda, HubbleParam
+                   struct.pack('<i', 0), struct.pack('<i', 0),    # flag_stellarage, flag_metals
+                   np.zeros(6, dtype='<u4').tobytes(),            # npartTotalHighWord[6]
+                   struct.pack('<i', 0)])                         # flag_entropy_instead_u
+  head += b'\x00' * (256 - len(head))
+  with open(filename, 'wb') as fh:
+    outer_block(fh, b'HEAD', head)
+    outer_block(fh, b'POS ', np.ascontiguousarray(pos[order], dtype='<f4').tobytes())
+    outer_block(fh, b'VEL ', np.ascontiguousarray(vel[order], dtype='<f4').tobytes())
+    outer_block(fh, b'ID  ', np.arange(1, len(pos)+1, dtype='<i4').tobytes())
+    outer_block(fh, b'MASS', np.ascontiguousarray(mass[order]/1e10, dtype='<f4').tobytes())
+  print ("  (*) Writing Gadget-2 (format 2) to \'%s\', npart by type = %s (kpc, km/s, 1e10 Msol)"%(filename, list(npart)) )
+
+
 def write_grafic(dirname, fields, dx):
   """RAMSES grafic gas files for a non-cosmological run (filetype='grafic'): one
   unformatted file per primitive variable (ic_d, ic_u, ic_v, ic_w, ic_p) in code units,

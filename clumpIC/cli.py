@@ -10,7 +10,7 @@ import numpy as np
 
 from clumpIC.eddington import build_df
 from clumpIC.sample import draw
-from clumpIC.writers import write_hdf5, write_ramses, write_grafic, MSOL, KPC
+from clumpIC.writers import write_hdf5, write_g2, write_ramses, write_grafic, MSOL, KPC
 
 G = 4.30091e-6   # kpc (km/s)^2 / Msol
 
@@ -93,7 +93,9 @@ def main():
   df = build_df(to_float(m["alpha"]), to_float(m["beta"]), to_float(m["gamma"]),
                 to_float(m.get("rmin", "1e-2")), to_float(m.get("rmax", "100")),
                 to_float(m.get("ne", "1e4")), to_float(m.get("nr", "1e4")),
-                to_float(m.get("epsrel", "1e-6")))
+                to_float(m.get("epsrel", "1e-6")),
+                to_float(m["r_trunc"]) if "r_trunc" in m else None,
+                to_float(m["r_decay"]) if "r_decay" in m else None)
   pos, vel = draw(df, N, min(N, to_float(m.get("ndraw", "1e6"))))
 
   o = config["output"]
@@ -103,8 +105,14 @@ def main():
 
   # physical scaling: (M=1, rscale=1, G=1) -> Msol, kpc, km/s
   s = config["scaling"]
-  M      = to_float(s["mass"])
   rscale = to_float(s["rscale"])
+  if "rho_s" in s:   # normalisation by the scale density instead of the total mass
+    M = to_float(s["rho_s"]) * rscale**3 * df["Mtot"]
+  else:
+    M = to_float(s["mass"])
+  if "r_trunc" in m:
+    print ("  (*) M(<r_trunc=%.2f kpc) = %.4e Msol, total profile mass = %.4e Msol"%(
+           to_float(m["r_trunc"])*rscale, M*np.interp(to_float(m["r_trunc"]), df["R"], df["Mcum"]), M) )
   centre   = np.array([to_float(v) for v in s.get("centre", "0,0,0").split(",")])
   velocity = np.array([to_float(v) for v in s.get("velocity", "0,0,0").split(",")])
   pos = pos * rscale
@@ -133,6 +141,14 @@ def main():
 
   if o.getboolean("hdf5", False):
     write_hdf5(name + ".hdf5", pos, vel, partmass)
+  if o.getboolean("g2", False):
+    # halo = Gadget type 1 (RAMSES FAM_DM), [particles] = type 4 (FAM_STAR); sinks are not
+    # part of a Gadget file (use ramses_ascii for ic_sink)
+    if len(sinks):
+      print ("  (!) g2: [sinks] not written to the Gadget file")
+    write_g2(name + ".g2", np.vstack((pos, particles[:,0:3])), np.vstack((vel, particles[:,3:6])),
+             np.concatenate((np.full(N, partmass), particles[:,6])),
+             np.concatenate((np.full(N, 1), np.full(len(particles), 4))))
   if o.getboolean("ramses_ascii", False):
     write_ramses(name + "_ramses",
                  np.vstack((pos, particles[:,0:3])), np.vstack((vel, particles[:,3:6])),

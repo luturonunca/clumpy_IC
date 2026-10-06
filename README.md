@@ -55,6 +55,12 @@ non-cosmological run the gas is then read from these files while the particles a
 the ascii `ic_part`. RAMSES does not refine at t=0 in this mode; finer levels are interpolated from
 `levelmin` during the first steps.
 
+For profiles whose mass diverges (beta <= 3, e.g. NFW), `r_trunc`/`r_decay` in `[model]` add the
+Kazantzidis et al. (2004) exponential cut-off; `rho_s` in `[scaling]` normalises by the scale density
+instead of `mass`. `g2 = true` in `[output]` writes a Gadget-2 (format 2) binary for the RAMSES DICE
+patch (`ic_format='Gadget2'`, kpc / km/s / 1e10 Msol): the halo as type 1 (DM) and `[particles]` as
+type 4 (stars).
+
 `mass` is the mass of the untruncated profile; particles only carry the part between `rmin` and
 `rmax`. A small `rmax` cuts through bound orbits and the outer halo expands: the printed
 virial ratio `2K / sum(m r.dPhi/dr)` is ~1 only when little mass lies beyond `rmax`.
