@@ -4,6 +4,24 @@
 import numpy as np
 
 
+def speeds_at(df, randR):
+  """Speeds of objects at given radii randR (units M=1, rscale=1, G=1), drawn from the DF with
+  the same energy rejection sampling as draw()."""
+  R, psi, E, DF, maxPLikelihood = df["R"], df["psi"], df["E"], df["DF"], df["maxPLikelihood"]
+  def PLikelihood(e,r): return np.interp(e,E,DF) * np.sqrt( 2.*(np.interp(r, R, psi) - e )) * r*r
+  psiR  = np.interp(randR ,R,psi)
+  randE = np.random.rand(len(randR)) * psiR
+  rhoE  = PLikelihood(randE,randR)
+  randY = np.random.rand(len(randR)) * np.interp(randR,R, maxPLikelihood)
+  Missidx = np.where(randY > rhoE)[0]
+  while len(Missidx):
+    randE[Missidx] = np.random.rand(len(Missidx)) * psiR[Missidx]
+    rhoE[Missidx]  = PLikelihood(randE[Missidx],randR[Missidx])
+    randY[Missidx] = np.random.rand(len(Missidx)) * np.interp(randR[Missidx],R, maxPLikelihood)
+    Missidx = np.where(randY > rhoE)[0]
+  return np.sqrt( 2.*(psiR - randE) )
+
+
 def draw(df, N, Ndraw):
   R, psi, E, DF = df["R"], df["psi"], df["E"], df["DF"]
   Mcum, maxPLikelihood = df["Mcum"], df["maxPLikelihood"]
