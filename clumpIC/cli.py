@@ -12,7 +12,7 @@ import numpy as np
 
 from clumpIC.eddington import build_df
 from clumpIC.sample import draw, speeds_at
-from clumpIC.writers import write_hdf5, write_g2, write_ramses, write_grafic, MSOL, KPC
+from clumpIC.writers import write_hdf5, write_g2, write_g2_merged, read_g2, write_ramses, write_grafic, MSOL, KPC
 
 G = 4.30091e-6   # kpc (km/s)^2 / Msol
 
@@ -113,6 +113,27 @@ def build_subhalo(abg, rs, Mtid, Rtid, partmass, sub):
   return p - p.mean(axis=0), v - v.mean(axis=0)
 
 
+def read_baryons(bar):
+  """Spherically averaged baryons of a Gadget-2 format-2 galaxy (e.g. DICE, centred on (0,0,0)):
+  all particles but the halo (type 1), sorted radii [kpc] and enclosed mass [Msol]."""
+  blocks = dict(read_g2(bar["file"]))
+  npart = np.frombuffer(blocks[b'HEAD'][0:24], dtype='<i4')
+  off = np.concatenate(([0], np.cumsum(npart)))
+  pos  = np.frombuffer(blocks[b'POS '], dtype='<f4').reshape(-1, 3).astype(float)
+  mass = np.frombuffer(blocks[b'MASS'], dtype='<f4').astype(float) * 1e10
+  if len(mass) != len(pos):
+    print ("  (!) %s: MASS block incomplete (header mass table). Aborting!"%bar["file"])
+    sys.exit()
+  keep = np.ones(len(pos), dtype=bool)
+  keep[off[1]:off[2]] = False
+  r = np.linalg.norm(pos[keep], axis=1)
+  order = np.argsort(r)
+  r, Mb = r[order], np.cumsum(mass[keep][order])
+  print ("  (*) baryons: %s, npart by type = %s, M_b = %.4e Msol, half-mass radius %.2f kpc"%(
+         bar["file"], list(npart), Mb[-1], np.interp(0.5*Mb[-1], Mb, r)) )
+  return r, Mb
+
+
 def main():
   parser = ArgumentParser(description="Equilibrium N-body ICs by Eddington inversion")
   parser.add_argument("-c", "--config", required=True, help="config file (.ini)")
@@ -128,12 +149,28 @@ def main():
   m = config["model"]
   np.random.seed(int(to_float(m.get("seed", "667408"))))
   N = int(to_float(m["npart"]))
+
+  # baryons (optional): the halo DF is built in the halo + spherically averaged baryon potential,
+  # the baryon particles themselves are not resampled (merge = true writes them with the halo)
+  mext = None
+  if config.has_section("baryons"):
+    if config.has_section("gas"):
+      print('  (!) [baryons] and [gas] together: the [gas] potential would miss the baryons. Aborting!')
+      sys.exit()
+    s = config["scaling"]
+    rb, Mb = read_baryons(config["baryons"])
+    rs_b = to_float(s["rscale"])
+    if "rho_s" in s:
+      mext = lambda x, Mtot: np.interp(x*rs_b, rb, Mb, left=0.) / (to_float(s["rho_s"])*rs_b**3*Mtot)
+    else:
+      mext = lambda x, Mtot: np.interp(x*rs_b, rb, Mb, left=0.) / to_float(s["mass"])
+
   df = build_df(to_float(m["alpha"]), to_float(m["beta"]), to_float(m["gamma"]),
                 to_float(m.get("rmin", "1e-2")), to_float(m.get("rmax", "100")),
                 to_float(m.get("ne", "1e4")), to_float(m.get("nr", "1e4")),
                 to_float(m.get("epsrel", "1e-6")),
                 to_float(m["r_trunc"]) if "r_trunc" in m else None,
-                to_float(m["r_decay"]) if "r_decay" in m else None)
+                to_float(m["r_decay"]) if "r_decay" in m else None, mext)
 
   # physical scaling: (M=1, rscale=1, G=1) -> Msol, kpc, km/s
   s = config["scaling"]
@@ -175,6 +212,8 @@ def main():
   # valid also for a truncated sample (mass outside r exerts no force)
   r_part = np.linalg.norm(pos, axis=1)
   rdphidr = G*M*np.interp(r_part/rscale, df["R"], df["Mcum"]) / r_part
+  if mext is not None:
+    rdphidr += G*np.interp(r_part, rb, Mb, left=0.) / r_part
   print ("  (*) 2K / sum(m r.dPhi/dr) = %.3f"%( np.sum(vel**2) / np.sum(rdphidr) ) )
 
   if config.has_section("subhalos"):
@@ -211,9 +250,18 @@ def main():
     # part of a Gadget file (use ramses_ascii for ic_sink)
     if len(sinks):
       print ("  (!) g2: [sinks] not written to the Gadget file")
-    write_g2(name + ".g2", np.vstack((pos, particles[:,0:3])), np.vstack((vel, particles[:,3:6])),
-             np.concatenate((np.full(N, partmass), particles[:,6])),
-             np.concatenate((np.full(N, 1), np.full(len(particles), 4))))
+    if config.has_section("baryons") and config["baryons"].getboolean("merge", False):
+      # baryon file + this halo in its type-1 slot: same frame, so the halo must sit on (0,0,0) at rest
+      if np.any(centre != 0.) or np.any(velocity != 0.):
+        print ("  (!) g2 merge: [scaling] centre and velocity must be 0,0,0 (frame of the baryon file). Aborting!")
+        sys.exit()
+      if len(particles):
+        print ("  (!) g2 merge: [particles] not written to the Gadget file")
+      write_g2_merged(name + ".g2", config["baryons"]["file"], pos, vel, np.full(N, partmass))
+    else:
+      write_g2(name + ".g2", np.vstack((pos, particles[:,0:3])), np.vstack((vel, particles[:,3:6])),
+               np.concatenate((np.full(N, partmass), particles[:,6])),
+               np.concatenate((np.full(N, 1), np.full(len(particles), 4))))
   if o.getboolean("ramses_ascii", False):
     write_ramses(name + "_ramses",
                  np.vstack((pos, particles[:,0:3])), np.vstack((vel, particles[:,3:6])),

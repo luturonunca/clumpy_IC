@@ -1,6 +1,7 @@
 #  Output formats. Positions in kpc, velocities in km/s, masses in Msol on input.
 
 import os
+import sys
 import numpy as np
 
 MSOL = 1.98892e33  # g
@@ -75,6 +76,67 @@ def write_g2(filename, pos, vel, mass, ptype):
     outer_block(fh, b'ID  ', np.arange(1, len(pos)+1, dtype='<i4').tobytes())
     outer_block(fh, b'MASS', np.ascontiguousarray(mass[order]/1e10, dtype='<f4').tobytes())
   print ("  (*) Writing Gadget-2 (format 2) to \'%s\', npart by type = %s (kpc, km/s, 1e10 Msol)"%(filename, list(npart)) )
+
+
+def read_g2(filename):
+  """Blocks of a Gadget-2 SnapFormat 2 file (e.g. DICE), as a list of (4-char label, raw bytes)."""
+  import struct
+  blocks = []
+  with open(filename, 'rb') as fh:
+    while True:
+      marker = fh.read(4)
+      if not marker:
+        break
+      label = fh.read(8); fh.read(4)          # label record: 4-char label, size of the next record
+      n = struct.unpack('<i', fh.read(4))[0]
+      data = fh.read(n); fh.read(4)
+      blocks.append((label[:4], data))
+  return blocks
+
+
+def write_g2_merged(filename, base, pos, vel, mass):
+  """Gadget-2 format 2: the file 'base' (e.g. DICE gas + stars + halo) with its halo (type 1)
+  replaced by pos, vel, mass (kpc, km/s, Msol). Blocks with an entry per particle (POS, VEL, ID,
+  MASS, Z) get the new halo in the type-1 slot (Z = 0, ids renumbered 1..N); blocks of the gas or
+  stars only (U, RHO, HSML, AGE) are copied unchanged."""
+  import struct
+  def outer_block(fh, tag4, payload):
+    fh.write(struct.pack('<i', 8)); fh.write(tag4)
+    fh.write(struct.pack('<i', len(payload)+8)); fh.write(struct.pack('<i', 8))
+    fh.write(struct.pack('<i', len(payload))); fh.write(payload); fh.write(struct.pack('<i', len(payload)))
+  blocks = read_g2(base)
+  head = bytearray(blocks[0][1])
+  npart = np.frombuffer(bytes(head[0:24]), dtype='<i4').copy()
+  if np.any(np.frombuffer(bytes(head[24:72]), dtype='<f8') != 0.):
+    print ("  (!) %s: header mass table not zero (MASS block incomplete). Aborting!"%base)
+    sys.exit()
+  ntot = npart.sum()
+  off = np.concatenate(([0], np.cumsum(npart)))
+  new_npart = npart.copy(); new_npart[1] = len(pos)
+  head[0:24]  = new_npart.astype('<i4').tobytes()     # npart[6]
+  head[96:120] = new_npart.astype('<u4').tobytes()    # npartTotal[6]
+  new = {b'POS ': pos, b'VEL ': vel, b'MASS': mass/1e10, b'Z   ': np.zeros(len(pos))}
+  with open(filename, 'wb') as fh:
+    outer_block(fh, b'HEAD', bytes(head))
+    for label, data in blocks[1:]:
+      ncomp = 3 if label in (b'POS ', b'VEL ') else 1
+      n = len(data) // (4*ncomp)
+      if n == ntot:   # one entry per particle: replace the halo slot
+        if label == b'ID  ':
+          data = np.arange(1, ntot-npart[1]+len(pos)+1, dtype='<i4').tobytes()
+        elif label in new:
+          arr = np.frombuffer(data, dtype='<f4').reshape(n, ncomp)
+          arr = np.vstack((arr[:off[1]], np.asarray(new[label], dtype='<f4').reshape(-1, ncomp), arr[off[2]:]))
+          data = arr.tobytes()
+        else:
+          print ("  (!) %s: block %s has halo entries and is not handled. Aborting!"%(base, label))
+          sys.exit()
+      elif n not in (npart[0], npart[2:].sum(), npart[0]+npart[2:].sum()):
+        print ("  (!) %s: block %s of %d entries, not matched to particle types. Aborting!"%(base, label, n))
+        sys.exit()
+      outer_block(fh, label, data)
+  print ("  (*) Writing Gadget-2 (format 2) to \'%s\': %s with its halo replaced, npart by type = %s"%(
+         filename, base, list(new_npart)) )
 
 
 def write_grafic(dirname, fields, dx):

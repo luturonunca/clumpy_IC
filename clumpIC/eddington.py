@@ -8,7 +8,7 @@ import numpy as np
 from scipy.integrate import quad
 
 
-def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL, rt=None, rd=None):
+def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL, rt=None, rd=None, mext=None):
   def rho_abg(r) :   return r**(-g) * (1. + r**a )**((g-b)/a)
   if rt is None:
     rho = rho_abg
@@ -37,6 +37,17 @@ def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL, rt=None, rd=None):
 
   print("      *  Building Psi and Nu arrays" )
   psi = - Phi(R)
+  if mext is not None:
+    # external spherical potential (e.g. the spherically averaged baryons of a galaxy): mext(x, M)
+    # is the external mass within x in units of the halo mass (M, the non-normalised mass above,
+    # is passed for the rho_s scaling), all of it inside Rmax:
+    # Phi_ext(x) = -mext(Rmax)/Rmax - int_x^Rmax mext(r)/r^2 dr. The density nu stays the halo's,
+    # so the DF is that of the halo in the total potential.
+    Mx = mext(R, M)
+    fx = Mx / R**2
+    tail = np.concatenate((np.cumsum((0.5*(fx[1:]+fx[:-1])*np.diff(R))[::-1])[::-1], [0.]))
+    print("     (!) external potential: mass %.4f of the halo, psi(Rmin) x %.3f"%(Mx[-1], 1.+(Mx[-1]/R[-1]+tail[0])/psi[0]))
+    psi = psi + Mx[-1]/R[-1] + tail
   nu  =   rho(R) / M
   Mcum = Mr(R)
 
