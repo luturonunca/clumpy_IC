@@ -15,6 +15,7 @@ from clumpIC.sample import draw, speeds_at
 from clumpIC.writers import write_hdf5, write_g2, write_g2_merged, read_g2, write_ramses, write_grafic, MSOL, KPC
 
 G = 4.30091e-6   # kpc (km/s)^2 / Msol
+MP, KB, MU_ION = 1.6726e-24, 1.380649e-16, 0.59   # g, erg/K, mean molecular weight of ionised gas
 
 
 def to_float(s):
@@ -96,21 +97,54 @@ def read_subhalos(sub, partmass):
   return pos[keep], d[keep,3:6], d[keep,6], d[keep,7], d[keep,8]
 
 
-def build_subhalo(abg, rs, Mtid, Rtid, partmass, sub):
+def build_subhalo(abg, rs, Mtid, Rtid, partmass, sub, fgas=0., mgas=1e5):
   """N-body subhalo: Zhao profile with scale radius rs and a Kazantzidis cut-off at its tidal
   radius (r_decay = rdecay_frac R_tid), Mtid/partmass particles of mass partmass, in kpc, km/s,
-  centred on (0,0,0) at rest."""
+  centred on (0,0,0) at rest. With fgas > 0, a fraction fgas of M_tid is gas instead of DM: an
+  isothermal sphere at the virial temperature, kT/(mu m_p) = v_max^2/2, in hydrostatic equilibrium
+  in the subhalo potential (gas self-gravity neglected in its own profile), cut at R_tid, as
+  fgas M_tid/mgas particles; the DM DF is then built in the DM + gas potential. Returns the DM
+  positions and velocities, the gas positions and c_s^2 [(km/s)^2] (None without gas)."""
   rt = Rtid/rs
   rd = to_float(sub.get("rdecay_frac", "0.1")) * rt
-  n  = max(1, int(round(Mtid/partmass)))
+  nr = to_float(sub.get("nr", "500"))
   with redirect_stdout(io.StringIO()):   # keep the per-subhalo inversion quiet
     df = build_df(abg[0], abg[1], abg[2], 1e-3, rt + 15*rd, to_float(sub.get("ne", "500")),
-                  to_float(sub.get("nr", "500")), 1e-6, rt, rd)
+                  nr, 1e-6, rt, rd)
+  ng = int(round(fgas*Mtid/mgas)) if fgas > 0. else 0
+  pg, cs2 = None, None
+  if ng > 0:
+    # potential of the whole subhalo (DM + gas ~ the M_tid profile), virial temperature from v_max
+    Mall = Mtid / (1.-df["fin"]-df["fout"])
+    x = df["R"]
+    vmax2 = G*Mall/rs * np.max(df["Mcum"]/x)
+    cs2 = 0.5*vmax2
+    rho_g = np.where(x <= rt, np.exp(-(G*Mall/rs)*(df["psi"][0]-df["psi"])/cs2), 0.)
+    Mg = np.concatenate(([0.], np.cumsum(0.5*(rho_g[1:]*x[1:]**2 + rho_g[:-1]*x[:-1]**2)*np.diff(x))))
+    Mg /= Mg[-1]                                          # gas mass fraction within x
+    rg = np.interp(np.random.rand(ng), Mg, x) * rs
+    u = np.random.normal(size=(ng, 3)); u /= np.linalg.norm(u, axis=1)[:,None]
+    pg = rg[:,None] * u
+  n  = max(1, int(round((Mtid - ng*mgas)/partmass)))
+  if ng > 0:
+    Mdm = n*partmass / (1.-df["fin"]-df["fout"])         # DM profile mass, units of mext
+    mext = lambda xx, Mtot: ng*mgas*np.interp(xx, x, Mg) / Mdm
+    with redirect_stdout(io.StringIO()):
+      df = build_df(abg[0], abg[1], abg[2], 1e-3, rt + 15*rd, to_float(sub.get("ne", "500")),
+                    nr, 1e-6, rt, rd, mext)
+  with redirect_stdout(io.StringIO()):
     p, v = draw(df, n, n)
   # the n particles carry the sampled part of the profile, whose total mass sets the velocities
   Mprof = n*partmass / (1.-df["fin"]-df["fout"])
   p = p*rs; v = v*np.sqrt(G*Mprof/rs)
-  return p - p.mean(axis=0), v - v.mean(axis=0)
+  shift = p.mean(axis=0)
+  return p - shift, v - v.mean(axis=0), (pg - shift if ng > 0 else None), cs2
+
+
+def _build_subhalo_seeded(args):
+  """build_subhalo with its own random seed (for the parallel subhalo construction)."""
+  np.random.seed(args[0] % 2**32)
+  return build_subhalo(*args[1:])
 
 
 def read_baryons(bar):
@@ -200,6 +234,7 @@ def main():
            len(sub_Mtid), to_float(sub.get("n_min", "100")), sub_Mtid.sum(), f_sub, N) )
 
   pos, vel = draw(df, N, min(N, to_float(m.get("ndraw", "1e6"))))
+  gas_pos, gas_vel, gas_cs2 = [], [], []   # subhalo gas particles (optional)
   o = config["output"]
   name = o.get("name", "model")
   if o.getboolean("npy", False):
@@ -223,19 +258,59 @@ def main():
     vdir = np.random.normal(size=(len(r_sub), 3))
     vdir /= np.linalg.norm(vdir, axis=1)[:,None]
     sub_vel = speeds_at(df, r_sub/rscale)[:,None] * vdir * np.sqrt(G*M/rscale)
-    for i in range(len(r_sub)):
-      p, v = build_subhalo(sub_abg[i], sub_rs[i], sub_Mtid[i], sub_Rtid[i], partmass, sub)
-      pos = np.vstack((pos, p + sub_pos[i]))
-      vel = np.vstack((vel, v + sub_vel[i]))
-    print ("  (*) subhalos: %d particles in %d subhalos (largest %d)"%(len(pos)-N, len(r_sub),
-           int(round(sub_Mtid.max()/partmass)) if len(r_sub) else 0) )
+    # gas (optional): gas_fraction = mw (baryon fraction of the host: [baryons] mass over host +
+    # baryons within r_trunc) or a number, for subhalos with M_tid >= gas_mmin
+    fgas, mgas = 0., to_float(sub.get("gas_particle_mass", "1e5"))
+    if "gas_fraction" in sub:
+      if sub["gas_fraction"].strip().lower() == "mw":
+        if mext is None:
+          print ("  (!) gas_fraction = mw needs [baryons]. Aborting!")
+          sys.exit()
+        Mh = M*np.interp(to_float(m["r_trunc"]), df["R"], df["Mcum"]) if "r_trunc" in m else M
+        fgas = Mb[-1] / (Mh + Mb[-1])
+        print ("  (*) subhalo gas: Milky Way baryon fraction %.4e / (%.4e + %.4e) = %.4f"%(Mb[-1], Mh, Mb[-1], fgas))
+      else:
+        fgas = to_float(sub["gas_fraction"])
+      gas_mmin = to_float(sub.get("gas_mmin", "0"))
+    # nproc > 1: subhalos built in parallel, each with its own seed (seed + 1 + index), so the result
+    # does not depend on nproc; nproc = 1 (default) keeps the single random stream of earlier versions
+    nproc = int(to_float(sub.get("nproc", "1")))
+    jobs = [(sub_abg[i], sub_rs[i], sub_Mtid[i], sub_Rtid[i], partmass, dict(sub),
+             fgas if (fgas > 0. and sub_Mtid[i] >= gas_mmin) else 0., mgas) for i in range(len(r_sub))]
+    if nproc > 1:
+      from multiprocessing import Pool
+      seed0 = int(to_float(m.get("seed", "667408")))
+      with Pool(nproc) as pool:
+        built = pool.map(_build_subhalo_seeded, [(seed0 + 1 + i,) + jb for i, jb in enumerate(jobs)], chunksize=4)
+    else:
+      built = [build_subhalo(*jb) for jb in jobs]
+    sub_p, sub_v = [pos], [vel]
+    for i, (p, v, pg, cs2) in enumerate(built):
+      sub_p.append(p + sub_pos[i]); sub_v.append(v + sub_vel[i])
+      if pg is not None:
+        gas_pos.append(pg + sub_pos[i]); gas_vel.append(np.tile(sub_vel[i], (len(pg), 1)))
+        gas_cs2.append(np.full(len(pg), cs2))
+    del built
+    pos, vel = np.vstack(sub_p), np.vstack(sub_v)
+    del sub_p, sub_v
+    print ("  (*) subhalos: %d particles in %d subhalos (largest %d)%s"%(len(pos)-N, len(r_sub),
+           int(round(sub_Mtid.max()/partmass)) if len(r_sub) else 0, ", %d processes"%nproc if nproc > 1 else "") )
+    if gas_pos:
+      T = np.concatenate(gas_cs2) * 1e10 * MU_ION * MP / KB
+      print ("  (*) subhalo gas: %d particles (%.4e Msol) in %d subhalos, T_vir = %.2e - %.2e K"%(
+             sum(len(g) for g in gas_pos), mgas*sum(len(g) for g in gas_pos), len(gas_pos), T.min(), T.max()) )
     N = len(pos)
 
+  gas_pos = np.vstack(gas_pos) if gas_pos else np.zeros((0, 3))
+  gas_vel = np.vstack(gas_vel) if gas_vel else np.zeros((0, 3))
   if s.getboolean("recentre", False):   # remove the sampling noise in the centre of mass
+    gas_pos -= pos.mean(axis=0); gas_vel -= vel.mean(axis=0)
     pos -= pos.mean(axis=0)
     vel -= vel.mean(axis=0)
   pos += centre
   vel += velocity
+  gas_pos += centre
+  gas_vel += velocity
 
   particles = read_objects(config, "particles", pos, partmass, centre, 0)
   sinks     = read_objects(config, "sinks",     pos, partmass, centre, 1)
@@ -257,8 +332,28 @@ def main():
         sys.exit()
       if len(particles):
         print ("  (!) g2 merge: [particles] not written to the Gadget file")
-      write_g2_merged(name + ".g2", config["baryons"]["file"], pos, vel, np.full(N, partmass))
+      # [satellite NAME]: galaxies (e.g. DICE, centred on (0,0,0) at rest) added at position [kpc]
+      # with bulk velocity [km/s], relative to the base galaxy (e.g. from clumpIC-rewind)
+      # spin (optional): direction of the satellite's stellar angular momentum, e.g. observed disc axis
+      satellites = [(config[sec]["file"],
+                     np.array([to_float(v) for v in config[sec]["position"].split(",")]),
+                     np.array([to_float(v) for v in config[sec]["velocity"].split(",")]),
+                     np.array([to_float(v) for v in config[sec]["spin"].split(",")]) if "spin" in config[sec] else None)
+                    for sec in config.sections() if sec.startswith("satellite ")]
+      for sec, (f, p, v, sp) in zip([sec for sec in config.sections() if sec.startswith("satellite ")], satellites):
+        print ("  (*) %s: %s at r = %.2f kpc, |v| = %.2f km/s"%(sec, f, np.linalg.norm(p), np.linalg.norm(v)))
+      extra_gas = None
+      if len(gas_pos):   # subhalo gas: internal energy per unit mass u = 3/2 c_s^2 [(km/s)^2]
+        extra_gas = (gas_pos, gas_vel, np.full(len(gas_pos), mgas), 1.5*np.concatenate(gas_cs2),
+                     np.full(len(gas_pos), to_float(sub["gas_metal"])))
+      nfile = write_g2_merged(name + ".g2", config["baryons"]["file"], pos, vel, np.full(N, partmass), satellites,
+                              config["baryons"].getboolean("zero_momentum", len(satellites) > 0), extra_gas,
+                              to_float(o.get("g2_max_particles", "1e8")))
+      if nfile > 1:
+        print ("  (!) g2 split in %d files: set ic_nfile = %d in &DICE_PARAMS (ic_file = '%s.g2')"%(nfile, nfile, name))
     else:
+      if len(gas_pos):
+        print ("  (!) g2: subhalo gas is only written with [baryons] merge = true")
       write_g2(name + ".g2", np.vstack((pos, particles[:,0:3])), np.vstack((vel, particles[:,3:6])),
                np.concatenate((np.full(N, partmass), particles[:,6])),
                np.concatenate((np.full(N, 1), np.full(len(particles), 4))))

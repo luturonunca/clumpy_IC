@@ -94,49 +94,151 @@ def read_g2(filename):
   return blocks
 
 
-def write_g2_merged(filename, base, pos, vel, mass):
+def rotation_to(c, t):
+  """Rotation matrix taking unit vector c onto unit vector t (Rodrigues; the roll about t is free)."""
+  k = np.cross(c, t); s, cth = np.linalg.norm(k), c @ t
+  if s < 1e-12:   # parallel or antiparallel
+    if cth > 0:
+      return np.eye(3)
+    a = np.cross(c, [1., 0., 0.] if abs(c[0]) < 0.9 else [0., 1., 0.]); a /= np.linalg.norm(a)
+    return 2.*np.outer(a, a) - np.eye(3)
+  k /= s
+  K = np.array([[0., -k[2], k[1]], [k[2], 0., -k[0]], [-k[1], k[0], 0.]])
+  return np.eye(3) + s*K + (1.-cth)*(K @ K)
+
+
+def write_g2_merged(filename, base, pos, vel, mass, satellites=(), zero_momentum=False, extra_gas=None,
+                    max_particles=1e8):
   """Gadget-2 format 2: the file 'base' (e.g. DICE gas + stars + halo) with its halo (type 1)
-  replaced by pos, vel, mass (kpc, km/s, Msol). Blocks with an entry per particle (POS, VEL, ID,
-  MASS, Z) get the new halo in the type-1 slot (Z = 0, ids renumbered 1..N); blocks of the gas or
-  stars only (U, RHO, HSML, AGE) are copied unchanged."""
+  replaced by pos, vel, mass (kpc, km/s, Msol), plus optional satellite galaxies: a list of
+  (file, position, velocity[, spin]), each a Gadget-2 format-2 galaxy (e.g. DICE) moved to position
+  [kpc] with bulk velocity [km/s]; with spin (a vector, or None), the galaxy is first rotated about its
+  centre so that the angular momentum of its stars (types 2-5) points along spin. Every block is assembled type by type, base first then the
+  satellites; blocks with an entry per particle (POS, VEL, ID, MASS, Z) get the new halo in the
+  base type-1 slot (Z = 0); blocks of the gas or stars only (U, RHO, HSML, AGE) are copied; ids are
+  renumbered 1..N. extra_gas = (pos, vel, mass, u, Z): gas particles (type 0) appended after those of
+  the galaxies, u = internal energy per unit mass [(km/s)^2], RHO and HSML set to 0 (not read by the
+  RAMSES DICE patch). zero_momentum: remove the mass-weighted mean velocity of all particles (the
+  positions are kept, so the base galaxy stays on its centre). Above max_particles in total the output is
+  split into files filename.1 .. filename.N (each with every type in proportion, as read by the RAMSES
+  DICE patch with ic_nfile = N; its 32-bit block sizes need < 1.79e8 particles per file); returns N."""
   import struct
   def outer_block(fh, tag4, payload):
     fh.write(struct.pack('<i', 8)); fh.write(tag4)
     fh.write(struct.pack('<i', len(payload)+8)); fh.write(struct.pack('<i', 8))
     fh.write(struct.pack('<i', len(payload))); fh.write(payload); fh.write(struct.pack('<i', len(payload)))
-  blocks = read_g2(base)
-  head = bytearray(blocks[0][1])
-  npart = np.frombuffer(bytes(head[0:24]), dtype='<i4').copy()
-  if np.any(np.frombuffer(bytes(head[24:72]), dtype='<f8') != 0.):
-    print ("  (!) %s: header mass table not zero (MASS block incomplete). Aborting!"%base)
+  def covered(n, npart, fname, label):   # particle types that a block of n entries covers
+    for types in ([0, 1, 2, 3, 4, 5], [0], [2, 3, 4, 5], [0, 2, 3, 4, 5]):
+      if n == npart[types].sum():
+        return types
+    print ("  (!) %s: block %s of %d entries, not matched to particle types. Aborting!"%(fname, label, n))
     sys.exit()
-  ntot = npart.sum()
-  off = np.concatenate(([0], np.cumsum(npart)))
-  new_npart = npart.copy(); new_npart[1] = len(pos)
-  head[0:24]  = new_npart.astype('<i4').tobytes()     # npart[6]
-  head[96:120] = new_npart.astype('<u4').tobytes()    # npartTotal[6]
-  new = {b'POS ': pos, b'VEL ': vel, b'MASS': mass/1e10, b'Z   ': np.zeros(len(pos))}
-  with open(filename, 'wb') as fh:
-    outer_block(fh, b'HEAD', bytes(head))
+  galaxies = []   # (file, npart, {label: {type: array}}, shift, boost)
+  for sat in [(base, None, None)] + list(satellites):
+    fname, shift, boost = sat[:3]
+    spin = sat[3] if len(sat) > 3 else None
+    blocks = read_g2(fname)
+    head = bytes(blocks[0][1])
+    if fname == base:
+      base_head, labels = head, [label for label, _ in blocks[1:]]
+    npart = np.frombuffer(head[0:24], dtype='<i4').copy()
+    if np.any(np.frombuffer(head[24:72], dtype='<f8') != 0.):
+      print ("  (!) %s: header mass table not zero (MASS block incomplete). Aborting!"%fname)
+      sys.exit()
+    split = {}
     for label, data in blocks[1:]:
       ncomp = 3 if label in (b'POS ', b'VEL ') else 1
-      n = len(data) // (4*ncomp)
-      if n == ntot:   # one entry per particle: replace the halo slot
-        if label == b'ID  ':
-          data = np.arange(1, ntot-npart[1]+len(pos)+1, dtype='<i4').tobytes()
-        elif label in new:
-          arr = np.frombuffer(data, dtype='<f4').reshape(n, ncomp)
-          arr = np.vstack((arr[:off[1]], np.asarray(new[label], dtype='<f4').reshape(-1, ncomp), arr[off[2]:]))
-          data = arr.tobytes()
-        else:
-          print ("  (!) %s: block %s has halo entries and is not handled. Aborting!"%(base, label))
+      arr = np.frombuffer(data, dtype='<i4' if label == b'ID  ' else '<f4').reshape(-1, ncomp)
+      types = covered(len(arr), npart, fname, label)
+      off = np.concatenate(([0], np.cumsum(npart[types])))
+      split[label] = {t: arr[off[k]:off[k+1]] for k, t in enumerate(types)}
+    if spin is not None:   # rotate about the centre of mass so that the stellar spin is along 'spin'
+      m = np.concatenate([split[b'MASS'][t][:, 0] for t in sorted(split[b'MASS'])]).astype(float)
+      x = np.concatenate([split[b'POS '][t] for t in sorted(split[b'POS '])]).astype(float)
+      v = np.concatenate([split[b'VEL '][t] for t in sorted(split[b'VEL '])]).astype(float)
+      xc, vc = (m[:, None]*x).sum(0)/m.sum(), (m[:, None]*v).sum(0)/m.sum()
+      st = [t for t in (2, 3, 4, 5) if t in split[b'POS '] and len(split[b'POS '][t])]
+      Ls = sum(np.cross(split[b'POS '][t].astype(float)-xc, split[b'VEL '][t].astype(float)-vc).sum(0)
+               for t in st)
+      target = np.asarray(spin, dtype=float)
+      Rm = rotation_to(Ls/np.linalg.norm(Ls), target/np.linalg.norm(target))
+      for t in split[b'POS ']:
+        split[b'POS '][t] = ((split[b'POS '][t].astype(float)-xc) @ Rm.T + xc).astype('<f4')
+        split[b'VEL '][t] = ((split[b'VEL '][t].astype(float)-vc) @ Rm.T + vc).astype('<f4')
+      print ("  (*) %s: stellar spin %s rotated onto %s"%(fname, np.round(Ls/np.linalg.norm(Ls), 3),
+             np.round(target/np.linalg.norm(target), 3)))
+    galaxies.append((fname, npart, split, shift, boost))
+  if extra_gas is not None:   # a pseudo-galaxy with gas only, laid out like the base blocks
+    gp, gv, gm, gu, gz = extra_gas
+    gas_data = {b'POS ': gp, b'VEL ': gv, b'MASS': gm/1e10, b'U   ': gu, b'Z   ': gz,
+                b'ID  ': np.zeros(len(gp)), b'RHO ': np.zeros(len(gp)), b'HSML': np.zeros(len(gp))}
+    split = {}
+    for label in labels:
+      ncomp = 3 if label in (b'POS ', b'VEL ') else 1
+      dt = '<i4' if label == b'ID  ' else '<f4'
+      split[label] = {t: np.zeros((0, ncomp), dtype=dt) for t in galaxies[0][2][label]}
+      if 0 in split[label]:
+        if label not in gas_data:
+          print ("  (!) %s: block %s has gas entries and is not handled for extra gas. Aborting!"%(base, label))
           sys.exit()
-      elif n not in (npart[0], npart[2:].sum(), npart[0]+npart[2:].sum()):
-        print ("  (!) %s: block %s of %d entries, not matched to particle types. Aborting!"%(base, label, n))
+        split[label][0] = np.asarray(gas_data[label], dtype=dt).reshape(len(gp), ncomp)
+    galaxies.append(("subhalo gas", None, split, None, None))
+  for fname, npart, split, shift, boost in galaxies[1:]:
+    if sorted(split) != sorted(labels) or any(sorted(split[l]) != sorted(galaxies[0][2][l]) for l in labels):
+      print ("  (!) %s: blocks differ from those of %s. Aborting!"%(fname, base))
+      sys.exit()
+  # base halo replaced, satellites moved
+  sp = galaxies[0][2]
+  new = {b'POS ': pos, b'VEL ': vel, b'MASS': mass/1e10, b'Z   ': np.zeros(len(pos))}
+  for label in labels:
+    if 1 in sp[label]:
+      if label in new:
+        sp[label][1] = np.asarray(new[label], dtype='<f4').reshape(len(pos), -1)
+      elif label != b'ID  ':
+        print ("  (!) %s: block %s has halo entries and is not handled. Aborting!"%(base, label))
         sys.exit()
-      outer_block(fh, label, data)
-  print ("  (*) Writing Gadget-2 (format 2) to \'%s\': %s with its halo replaced, npart by type = %s"%(
-         filename, base, list(new_npart)) )
+  for fname, npart, split, shift, boost in galaxies[1:]:
+    if shift is None:
+      continue
+    for t in split[b'POS ']:
+      split[b'POS '][t] = (split[b'POS '][t] + shift).astype('<f4')
+      split[b'VEL '][t] = (split[b'VEL '][t] + boost).astype('<f4')
+  new_npart = np.zeros(6, dtype=int)
+  for t in range(6):
+    new_npart[t] = sum(len(g[2][b'POS '][t]) for g in galaxies)
+  # per label and type: base first, then the satellites and the extra gas
+  cat = {label: {t: np.concatenate([g[2][label][t] for g in galaxies]) for t in sorted(sp[label])}
+         for label in labels}
+  del galaxies, sp
+  first_id = np.concatenate(([1], 1 + np.cumsum(new_npart)))    # ids 1..N in type order
+  cat[b'ID  '] = {t: np.arange(first_id[t], first_id[t+1], dtype='<i4').reshape(-1, 1) for t in cat[b'ID  ']}
+  if zero_momentum:
+    m = np.concatenate([cat[b'MASS'][t][:, 0] for t in sorted(cat[b'MASS'])]).astype(float)
+    vel_all = np.concatenate([cat[b'VEL '][t] for t in sorted(cat[b'VEL '])]).astype(float)
+    vcm = (m[:, None]*vel_all).sum(axis=0) / m.sum()
+    del m, vel_all
+    for t in cat[b'VEL ']:
+      cat[b'VEL '][t] = (cat[b'VEL '][t] - vcm).astype('<f4')
+    print ("  (*) zero total momentum: removed v_cm = (%.3f, %.3f, %.3f) km/s from all particles"%tuple(vcm))
+  nfile = max(1, int(np.ceil(new_npart.sum() / float(max_particles))))
+  for k in range(nfile):
+    # file k: the k-th slice of every particle type
+    lo = (new_npart * k) // nfile; hi = (new_npart * (k+1)) // nfile
+    head = bytearray(base_head)
+    head[0:24]  = (hi-lo).astype('<i4').tobytes()            # npart[6] of this file
+    head[96:120] = new_npart.astype('<u4').tobytes()         # npartTotal[6]
+    head[124:128] = np.array([nfile], dtype='<i4').tobytes() # num_files
+    fname = filename if nfile == 1 else "%s.%d"%(filename, k+1)
+    with open(fname, 'wb') as fh:
+      outer_block(fh, b'HEAD', bytes(head))
+      for label in labels:
+        outer_block(fh, label, np.ascontiguousarray(
+          np.concatenate([cat[label][t][lo[t]:hi[t]] for t in sorted(cat[label])])).tobytes())
+  print ("  (*) Writing Gadget-2 (format 2) to \'%s\'%s: %s with its halo replaced%s, npart by type = %s"%(
+         filename, "" if nfile == 1 else ".1 .. .%d (ic_nfile = %d)"%(nfile, nfile), base,
+         "".join(" + %s"%f for f, *_ in satellites) + (" + subhalo gas" if extra_gas is not None else ""),
+         list(new_npart)) )
+  return nfile
 
 
 def write_grafic(dirname, fields, dx):
