@@ -122,8 +122,135 @@ def host_profile(host_ini):
   return r, Mtot, rho, sigma
 
 
+_FIT_OBJECTIVE = None
+def _fit_call(par):
+  """Objective of the bound-satellite orbit fit, for multiprocessing (set as a global before forking)."""
+  return _FIT_OBJECTIVE(par)
+
+
 def m_hernquist(M, a, r):
   return M * r**2 / (r+a)**2
+
+
+def fit_bound(k, x_start, v_start, free, ns, names, bound, rcut, Mh, aH, Mb, a_s, m_enc, m_inj, mscale,
+              Mmw_at, r, rho, sigma, t_end, sec, bound_offset, orbits_name):
+  """Forward fit of the orbit of bound satellite k around its host (see fit_today in main). x_start,
+  v_start: MW + free satellites at -lookback from the backward rewind. Returns ([ra, e, psi], report)."""
+  global _FIT_OBJECTIVE
+  h = names.index(bound[k])
+  C, alpha = 1.22, 1.0
+  sep, sep_e = [to_float(v) for v in sec.get("target_separation", "23, 3").split(",")]
+  rv, rv_e = [to_float(v) for v in sec.get("target_relvel", "128, 32").split(",")]
+  enc_d, enc_de, enc_t, enc_te = [to_float(v) for v in sec.get("target_encounter", "7.5, 2.5, -0.147, 0.033").split(",")]
+  early_min = to_float(sec.get("early_pericentre_min", "20"))
+  recent = to_float(sec.get("recent_window", "0.4"))            # Gyr: the encounter is looked for in it
+  # time_shift [Gyr]: measured delay of the live simulation with respect to this rigid forward model
+  # (e.g. from a first run); the targets are applied at -time_shift on the fitted orbit, so that with the
+  # delay they are met at the end of the simulation (iteration on the N-body result, as Vasiliev et al. 2021)
+  shift = to_float(sec.get("time_shift", "0"))
+  # host_today = distance, error [kpc]: the host's distance from the MW at the end of the forward run
+  # (the satellite's pull changes the host's orbit); not shifted
+  host_today = [to_float(v) for v in sec["host_today"].split(",")] if "host_today" in sec else None
+  # host density (truncated Hernquist halo) and isotropic Jeans dispersion
+  q = np.logspace(-2, np.log10(max(rcut[h], 1.)), 2000)
+  rho_h = Mh[h]*aH[h]/(2.*np.pi*q*(q+aH[h])**3)
+  f = rho_h*G*np.array([m_enc(h, x) for x in q])/q**2
+  tail = np.concatenate((np.cumsum((0.5*(f[1:]+f[:-1])*np.diff(q))[::-1])[::-1], [0.]))
+  sig_h = np.sqrt(tail/rho_h)
+  bodies = list(free) + [k]
+  nb = len(bodies)
+  ih = 1 + bodies.index(h); ik = nb
+
+  def deriv(t, y):
+    x = y[:3*(nb+1)].reshape(nb+1, 3); v = y[3*(nb+1):].reshape(nb+1, 3)
+    a = np.zeros_like(x)
+    for i in range(1, nb+1):
+      kb = bodies[i-1]; sk = mscale(kb, t)
+      d = x[i] - x[0]; dn = np.linalg.norm(d)
+      a[i] -= G*Mmw_at(dn) * d/dn**3
+      a[0] += G*sk*m_enc(kb, dn) * d/dn**3
+      vr = v[i] - v[0]; vn = np.linalg.norm(vr)
+      X = vn / (np.sqrt(2.)*max(np.interp(dn, r, sigma), 1e-3))
+      lnL = max(0., np.log(dn/(C*a_s[kb]))**alpha)
+      a[i] -= 4.*np.pi*G**2*sk*m_inj(kb)*lnL*np.interp(dn, r, rho, right=0.)/vn**2 * \
+              (erf(X) - 2.*X/np.sqrt(np.pi)*np.exp(-X*X)) * vr/vn
+      for j in range(1, nb+1):
+        if j != i:
+          kj = bodies[j-1]
+          dj = x[i] - x[j]; djn = np.linalg.norm(dj)
+          a[i] -= G*mscale(kj, t)*m_enc(kj, djn) * dj/djn**3
+    # friction of the host's halo on the bound satellite
+    d = x[ik] - x[ih]; dn = np.linalg.norm(d)
+    if dn < rcut[h]:
+      vr = v[ik] - v[ih]; vn = np.linalg.norm(vr)
+      X = vn / (np.sqrt(2.)*max(np.interp(dn, q, sig_h), 1e-3))
+      lnL = max(0., np.log(dn/(C*a_s[k]))**alpha)
+      a[ik] -= 4.*np.pi*G**2*m_inj(k)*lnL*np.interp(dn, q, rho_h)/vn**2 * \
+               (erf(X) - 2.*X/np.sqrt(np.pi)*np.exp(-X*X)) * vr/vn
+    return np.concatenate((v.ravel(), a.ravel()))
+
+  t_eval = np.linspace(t_end, 0., int(round(-t_end*TU/0.0025))+1)
+  def run(par):
+    ra, e, psi = par
+    dx, dv = bound_offset(k, ra, e, psi)
+    x0 = np.vstack((x_start, x_start[ih] + dx)); v0 = np.vstack((v_start, v_start[ih] + dv))
+    sol = solve_ivp(deriv, (t_end, 0.), np.concatenate((x0.ravel(), v0.ravel())), method="DOP853",
+                    t_eval=t_eval, rtol=1e-8, atol=1e-8)
+    Xf = sol.y[:3*(nb+1)].T.reshape(-1, nb+1, 3); Vf = sol.y[3*(nb+1):].T.reshape(-1, nb+1, 3)
+    return sol.t*TU, np.linalg.norm(Xf[:, ik]-Xf[:, ih], axis=1), np.linalg.norm(Vf[:, ik]-Vf[:, ih], axis=1), Xf, Vf
+
+  def measures(tg, d, vrel):
+    keep = tg + shift <= 1e-9
+    tg, d, vrel = tg[keep] + shift, d[keep], vrel[keep]
+    rec = tg > -recent
+    j = np.argmin(np.where(rec, d, np.inf))
+    early = ~rec
+    peri = [d[i] for i in range(1, len(d)-1) if early[i] and d[i] < d[i-1] and d[i] < d[i+1]]
+    return d[-1], vrel[-1], d[j], tg[j], (min(peri) if peri else d[early].min())
+
+  Xf_last = [None]
+  def chi2(par):
+    ra, e, psi = par
+    if not (5. < ra < 150. and 0. <= e < 0.95):
+      return 1e6
+    try:
+      tg, d, vrel, Xf, _ = run(par)
+    except Exception:
+      return 1e6
+    Xf_last[0] = Xf[-1]
+    d0, v0, dmin, tmin, emin = measures(tg, d, vrel)
+    c = ((d0-sep)/sep_e)**2 + ((v0-rv)/rv_e)**2 + ((dmin-enc_d)/enc_de)**2 + ((tmin-enc_t)/enc_te)**2
+    if host_today is not None:
+      c += ((np.linalg.norm(Xf_last[0][ih]-Xf_last[0][0]) - host_today[0])/host_today[1])**2
+    return c + 100.*(max(0., early_min - emin)/5.)**2
+
+  # grid over the orbit, in parallel, then Nelder-Mead from the best point
+  grid = [(ra, e, psi) for ra in np.arange(20., 101., 10.) for e in (0.0, 0.15, 0.3, 0.45, 0.6, 0.75)
+          for psi in np.radians(np.arange(0., 360., 30.))]
+  _FIT_OBJECTIVE = chi2
+  nproc = int(to_float(sec.get("fit_nproc", "16")))
+  from multiprocessing import get_context
+  with get_context("fork").Pool(nproc) as pool:
+    vals = pool.map(_fit_call, grid, chunksize=4)
+  best = grid[int(np.argmin(vals))]
+  from scipy.optimize import minimize
+  res = minimize(chi2, best, method="Nelder-Mead", options={"xatol": 0.05, "fatol": 0.01, "maxiter": 300})
+  par = list(res.x) if res.fun < min(vals) else list(best)
+  par[2] = par[2] % (2.*np.pi)
+  tg, d, vrel, Xf, Vf = run(par)
+  d0, v0, dmin, tmin, emin = measures(tg, d, vrel)
+  np.savetxt(orbits_name.replace(".txt", "_%s_fit.txt"%names[k]),
+             np.column_stack((tg, d, vrel, np.linalg.norm(Xf[:, ik]-Xf[:, 0], axis=1),
+                              np.linalg.norm(Xf[:, ih]-Xf[:, 0], axis=1))),
+             header="t [Gyr]  d_%s-%s [kpc]  v_rel [km/s]  r_%s [kpc]  r_%s [kpc] (forward fit run)"%(
+                    names[k], names[h], names[k], names[h]))
+  report = ("today: separation %.1f kpc (target %.0f+-%.0f), relative speed %.0f km/s (%.0f+-%.0f); closest in the "
+            "last %.1f Gyr %.1f kpc at %.3f Gyr (%.1f+-%.1f at %.3f+-%.3f); earliest pericentres >= %.1f kpc (min %.0f); "
+            "chi2 %.2f; %s today at %.1f kpc from the MW%s") % (
+            d0, sep, sep_e, v0, rv, rv_e, recent, dmin, tmin, enc_d, enc_de, enc_t, enc_te, emin, early_min,
+            chi2(par), names[h], np.linalg.norm(Xf[-1, ih]-Xf[-1, 0]),
+            "; targets applied %.2f Gyr before the end (time_shift)"%shift if shift else "")
+  return par, report
 
 
 def main():
@@ -203,27 +330,39 @@ def main():
   v0 = np.vstack([np.zeros(3)] + [vec(cfg[sats[k]]["velocity"]) for k in free])
   t_eval = np.linspace(0., t_end, int(round(lookback/to_float(cfg["time"].get("dt_out", "0.005"))))+1)
 
+  # orbit of each bound satellite: apocentre, eccentricity and psi, the angle in the orbital plane from
+  # today's separation direction to the apocentre (fitted with fit_today = true)
+  bound_par = {k: [to_float(cfg[sats[k]]["apocentre"]), to_float(cfg[sats[k]]["eccentricity"]),
+                   to_float(cfg[sats[k]].get("psi", "0"))] for k in range(ns) if bound[k] is not None}
+
+  def bound_offset(k, ra, e, psi):
+    """Position and velocity of bound satellite k relative to its host, at apocentre ra of an orbit of
+    eccentricity e in the host's (truncated Hernquist + baryons) potential, in the plane and with the
+    sense of today's relative orbit, the apocentre at angle psi from today's separation direction."""
+    h = names.index(bound[k])
+    sec, hsec = cfg[sats[k]], cfg[sats[h]]
+    dx0 = vec(sec["position"]) - vec(hsec["position"]); dv0 = vec(sec["velocity"]) - vec(hsec["velocity"])
+    n = np.cross(dx0, dv0); n /= np.linalg.norm(n)
+    u0 = dx0 - (dx0 @ n)*n; u0 /= np.linalg.norm(u0)
+    u = np.cos(psi)*u0 + np.sin(psi)*np.cross(n, u0)
+    w = np.cross(n, u)
+    rp = ra*(1.-e)/(1.+e)
+    q = np.logspace(-3, 4, 4000)
+    f = G*np.array([m_enc(h, x) for x in q])/q**2
+    tail = np.concatenate((np.cumsum((0.5*(f[1:]+f[:-1])*np.diff(q))[::-1])[::-1], [0.]))
+    phi = lambda x: -np.interp(x, q, tail) - G*m_inj(h)/q[-1]
+    vt = np.sqrt(2.*(phi(ra)-phi(rp)) / (ra**2/rp**2 - 1.)) if e > 0. else np.sqrt(G*m_enc(h, ra)/ra)
+    return ra*u, vt*w
+
   def place_bound(xr, vr):
-    """Satellites bound_to another satellite: placed at apocentre on an orbit of eccentricity e in the
-    host's (truncated Hernquist + baryons) potential, with the plane and sense of today's relative orbit."""
+    """Satellites bound_to another satellite: placed at apocentre around their host (bound_offset)."""
     for k in range(ns):
       if bound[k] is None:
         continue
       h = names.index(bound[k])
-      sec, hsec = cfg[sats[k]], cfg[sats[h]]
-      dx0 = vec(sec["position"]) - vec(hsec["position"]); dv0 = vec(sec["velocity"]) - vec(hsec["velocity"])
-      n = np.cross(dx0, dv0); n /= np.linalg.norm(n)
-      u = dx0 - (dx0 @ n)*n; u /= np.linalg.norm(u)
-      w = np.cross(n, u)
-      ra, e = to_float(sec["apocentre"]), to_float(sec["eccentricity"])
-      rp = ra*(1.-e)/(1.+e)
-      q = np.logspace(-3, 4, 4000)
-      f = G*np.array([m_enc(h, x) for x in q])/q**2
-      tail = np.concatenate((np.cumsum((0.5*(f[1:]+f[:-1])*np.diff(q))[::-1])[::-1], [0.]))
-      phi = lambda x: -np.interp(x, q, tail) - G*m_inj(h)/q[-1]
-      vt = np.sqrt(2.*(phi(ra)-phi(rp)) / (ra**2/rp**2 - 1.))
-      xr[k] = xr[h] + ra*u
-      vr[k] = vr[h] + vt*w
+      dx, dv = bound_offset(k, *bound_par[k])
+      xr[k] = xr[h] + dx
+      vr[k] = vr[h] + dv
     return xr, vr
 
   def tidal_radii(xr, vr):
@@ -271,6 +410,30 @@ def main():
       break
   else:
     print ("  (!) tidal radii not converged after 10 iterations")
+
+  # fit_today (bound satellites): the orbit around the host (apocentre, eccentricity, psi) is chosen by
+  # integrating MW + all satellites forward from -lookback (with the host's dynamical friction on the
+  # satellite) and matching today's relative separation and speed and a recent close encounter, keeping
+  # earlier pericentres outside early_pericentre_min. A pass is accepted when the cut used in the fit lies
+  # inside the tidal radius at the fitted start; otherwise the cut is set to that tidal radius and refitted.
+  fit_ks = [k for k in range(ns) if bound[k] is not None and cfg[sats[k]].getboolean("fit_today", False)]
+  for k in fit_ks:
+    for fit_pass in (1, 2, 3):
+      bound_par[k], fit_report = fit_bound(k, X[-1], V[-1], free, ns, names, bound, rcut, Mh, aH, Mb, a_s,
+                                           m_enc, m_inj, mscale, Mmw_at, r, rho, sigma, t_end, cfg[sats[k]],
+                                           bound_offset, cfg["time"].get("orbits", "orbits_rewound.txt"))
+      xr, vr = place_bound(xr, vr)
+      tr = tidal_radii(xr, vr)
+      print ("  (*) %s fit pass %d: apocentre %.1f kpc, e = %.3f, psi = %.1f deg; %s; tidal radius %.2f kpc"%(
+             names[k], fit_pass, bound_par[k][0], bound_par[k][1], np.degrees(bound_par[k][2]), fit_report, tr[k][0][0]))
+      # accepted when the cut used in the fit lies inside the tidal radius at the fitted start: the
+      # satellite is injected with that cut, so its mass is the one the orbit was fitted with
+      if rcut[k] <= tr[k][0][0]:
+        tr[k] = ((rcut[k], "fit; tidal radius %.2f"%tr[k][0][0]), tr[k][1])
+        break
+      rcut[k] = tr[k][0][0]
+    else:
+      print ("  (!) %s fit: cut used in the fit exceeds the tidal radius after 3 passes; cut at the tidal radius"%names[k])
 
   fnames = [names[k] for k in free]
   dist = np.linalg.norm(X[:, 1:] - X[:, :1], axis=2)
