@@ -168,7 +168,30 @@ def read_baryons(bar):
   return r, Mb
 
 
+BANNER = r"""
+✦         .....        *
+      ····....···::                                                        ▄▄▄▄▄         ▄▄   ▄
+    :░▒::·······:░▓░:                ▄▀                                  ▄█▀▀▀███▄     █▀  ▄█▀███
+   ·:░░::::::::······.              ██             ▄   ▄   ▄   ▄▄        █      ▀█▀   ██ ▄██
+  .·····:::░░░:::····..      ▄█▀█▄  ██   ██▄  ██   ██▄▀██▄▀██▄ ▀██▄ ██▄  █      ██   ▄██ ▀██▄▄
+  ..····::░▒█▒░::·····.      █  ▀▀  ██    ██  ██   ██  ██  ██    ██  ██   ▀▄▄▄ ▀██▄  ▀██   ▀██▄
+  .·····:::░░░:::·:::··     ▀█▄     ██    ██  ██   ██  ██  ██    ██  ██         ▀██▄  ███    █▀
+   :░:····:::::··::▒▓░       ██▄    ██▄  ▄██▄▄██▄  ██▄ ██▄ ██▄ ▄███▄▄█▀   ▄▄      ██   ▀██▄▄▀   ▄
+    ░░:·····:::····::         ▀▀▀    ▀▀    ▀▀ ▀▀▀  ▀▀  ▀▀   ▀▀   ██▀▀    ▀▀██▄    █▀     ▀▀▀▀▀▀▀
+      ·..···:▓▒:···                                              █          ▀▀▀▀▀▀
+*         .····         ✦
+
+                                   .-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-.
+                                   ( ✦    Eddington-inverted halos, lumps included    ✦ )
+                                   '-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-'
+                                              "it's not a bug, it's a subhalo"
+"""
+
 def main():
+  try:
+    print (BANNER)
+  except UnicodeEncodeError:   # non-UTF-8 terminal or log: plain-text title
+    print ("\n  clumpIC -- Eddington-inverted halos, lumps included\n")
   parser = ArgumentParser(description="Equilibrium N-body ICs by Eddington inversion")
   parser.add_argument("-c", "--config", required=True, help="config file (.ini)")
   args = parser.parse_args()
