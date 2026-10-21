@@ -300,13 +300,25 @@ def main():
     nproc = int(to_float(sub.get("nproc", "1")))
     jobs = [(sub_abg[i], sub_rs[i], sub_Mtid[i], sub_Rtid[i], partmass, dict(sub),
              fgas if (fgas > 0. and sub_Mtid[i] >= gas_mmin) else 0., mgas) for i in range(len(r_sub))]
+    import time
+    t0 = time.time()
+    def progress(i):   # every ~2 per cent of the subhalos: count, elapsed time, estimate of the rest
+      if (i+1) % max(1, len(jobs)//50) == 0 or i+1 == len(jobs):
+        dt = time.time() - t0
+        print ("      subhalos built: %d / %d (%.1f per cent), %.1f min, ~%.1f min left"%(
+               i+1, len(jobs), 100.*(i+1)/len(jobs), dt/60., dt/60.*(len(jobs)-i-1)/(i+1)), flush=True)
+    built = []
     if nproc > 1:
-      from multiprocessing import Pool
+      from multiprocessing import get_context
       seed0 = int(to_float(m.get("seed", "667408")))
-      with Pool(nproc) as pool:
-        built = pool.map(_build_subhalo_seeded, [(seed0 + 1 + i,) + jb for i, jb in enumerate(jobs)], chunksize=4)
+      # spawn: fresh workers, a fork would duplicate the whole host sample (ENOMEM at HR)
+      with get_context("spawn").Pool(nproc) as pool:
+        for i, b in enumerate(pool.imap(_build_subhalo_seeded,
+                                        [(seed0 + 1 + i,) + jb for i, jb in enumerate(jobs)], chunksize=4)):
+          built.append(b); progress(i)
     else:
-      built = [build_subhalo(*jb) for jb in jobs]
+      for i, jb in enumerate(jobs):
+        built.append(build_subhalo(*jb)); progress(i)
     sub_p, sub_v = [pos], [vel]
     for i, (p, v, pg, cs2) in enumerate(built):
       sub_p.append(p + sub_pos[i]); sub_v.append(v + sub_vel[i])
