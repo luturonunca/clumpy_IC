@@ -310,12 +310,24 @@ def main():
     built = []
     if nproc > 1:
       from multiprocessing import get_context
+      from concurrent.futures import ProcessPoolExecutor
+      from concurrent.futures.process import BrokenProcessPool
       seed0 = int(to_float(m.get("seed", "667408")))
-      # spawn: fresh workers, a fork would duplicate the whole host sample (ENOMEM at HR)
-      with get_context("spawn").Pool(nproc) as pool:
-        for i, b in enumerate(pool.imap(_build_subhalo_seeded,
-                                        [(seed0 + 1 + i,) + jb for i, jb in enumerate(jobs)], chunksize=4)):
-          built.append(b); progress(i)
+      args = [(seed0 + 1 + i,) + jb for i, jb in enumerate(jobs)]
+      built = [None] * len(jobs)
+      # spawn: fresh workers, a fork would duplicate the whole host sample (ENOMEM at HR). A worker that
+      # dies breaks the executor (a Pool would wait forever for its task): the missing subhalos are rebuilt
+      for attempt in range(3):
+        todo = [i for i in range(len(jobs)) if built[i] is None]
+        try:
+          with ProcessPoolExecutor(nproc, mp_context=get_context("spawn")) as ex:
+            for i, b in zip(todo, ex.map(_build_subhalo_seeded, [args[i] for i in todo], chunksize=4)):
+              built[i] = b; progress(len(jobs) - built.count(None) - 1)
+        except BrokenProcessPool:
+          print ("  (!) a subhalo worker died: %d subhalos left, new pool"%built.count(None), flush=True)
+      if None in built:
+        print ("  (!) subhalos could not be built after 3 attempts. Aborting!")
+        sys.exit(1)
     else:
       for i, jb in enumerate(jobs):
         built.append(build_subhalo(*jb)); progress(i)
