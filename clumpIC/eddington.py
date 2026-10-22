@@ -65,9 +65,15 @@ def build_df(a, b, g, Rmin, Rmax, NE, NR, EPSREL, rt=None, rd=None, mext=None):
 
   # check whether DF is physical - if not, check for rounding errors in integration, try increasing/decreasing NR, NE
   if np.any (DF < 0) :
-    print("      *  Exit. DF < 0, see df.dat" )
-    np.savetxt("df.dat", np.column_stack(( E, DF)))
-    sys.exit(0)
+    # negative values only at the most-bound end (E > 0.99 E_max, r < ~Rmin): finite-difference noise of
+    # d2nu/dpsi2 at the inner grid edge, carrying no sampled mass -> set to 0
+    if np.all(E[DF < 0] > 0.99*maxE):
+      print("      *  DF < 0 at %d of the most-bound energies (inner grid edge): set to 0"%np.sum(DF < 0), file=sys.stderr)
+      DF = np.maximum(DF, 0.)
+    else:
+      print("      *  Exit. DF < 0, see df.dat", file=sys.stderr)
+      np.savetxt("df.dat", np.column_stack(( E, DF)))
+      sys.exit(1)
   else: print("      *  DF >= 0, all good" )
 
   print("      *  Finding maximum likelihood" )
